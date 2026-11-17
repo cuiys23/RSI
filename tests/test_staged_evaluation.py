@@ -2,6 +2,7 @@ import ast
 import csv
 import json
 import os
+import posixpath
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,7 @@ class StagedEvaluationTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows({'question_id': str(i), 'prediction': 'None'} for i in range(count))
             (Path(dest_path) / 'report.json').write_text(json.dumps({'total': count, 'total_correct': 1}))
-        namespace = dict(TASK_MODEL='test', os=os, json=json, REPO_NAME='repo', log_container_output=Mock(), copy_from_container=copy_output)
+        namespace = dict(TASK_MODEL='test', os=os, posixpath=posixpath, json=json, REPO_NAME='repo', log_container_output=Mock(), copy_from_container=copy_output)
         exec(compile(ast.Module(body=[function], type_ignores=[]), 'generate_loop.py', 'exec'), namespace)
         evaluate = namespace['eval_produced_agent']
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import posixpath
 import random
 
 from utils.experiment import META_MODEL, TASK_MODEL, MAX_GENERATION, RANDOM_SEED, summarize_usage
@@ -124,7 +125,7 @@ def select_next_parent_container(
     image_name = f"{REPO_NAME}"
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     container_name = f"{REPO_NAME}-nextparent-container-{run_id}"
-    container = build_container(docker_client, root_dir, image_name, container_name, verbose=False)
+    container = build_container(docker_client, root_dir, image_name, container_name, domains=domains, verbose=False)
     container.start()
     container_output_folder = "/tmp/"
 
@@ -133,7 +134,7 @@ def select_next_parent_container(
         commit_hash = apply_diffs_container(container, prev_patch_files, verbose=False)
 
         # Copy generate_output_dir to container
-        container_generate_output_dir = os.path.join(
+        container_generate_output_dir = posixpath.join(
             container_output_folder, generate_output_dir.split(os.sep)[-1]
         )
         copy_to_container(
@@ -220,7 +221,7 @@ def get_ensemble_scores_container(
     image_name = f"{REPO_NAME}"
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     container_name = f"{REPO_NAME}-ens-container-{run_id}"
-    container = build_container(docker_client, root_dir, image_name, container_name)
+    container = build_container(docker_client, root_dir, image_name, container_name, domains=[domain])
     container.start()
     container_output_folder = "/tmp/"
 
@@ -229,7 +230,7 @@ def get_ensemble_scores_container(
         commit_hash = apply_diffs_container(container, prev_patch_files)
 
         # Copy generate_output_dir to container
-        container_generate_output_dir = os.path.join(
+        container_generate_output_dir = posixpath.join(
             container_output_folder, generate_output_dir.split(os.sep)[-1]
         )
         copy_to_container(
@@ -269,8 +270,8 @@ def get_ensemble_scores_container(
             container_report_path = container_output_strings[-1]
 
             # Copy container outputs to local
-            predictions_file = os.path.basename(container_predictions_path)
-            report_file = os.path.basename(container_report_path)
+            predictions_file = posixpath.basename(container_predictions_path)
+            report_file = posixpath.basename(container_report_path)
             local_predictions_path = os.path.join(gen_output_dir, predictions_file)
             local_report_path = os.path.join(gen_output_dir, report_file)
             copy_from_container(
@@ -325,7 +326,7 @@ def eval_produced_agent(
         eval_samples = 10 if stage == "screen" else 100
     base_run_id = f"{domain}_eval" if split == "train" else f"{domain}_eval_{split}"
     eval_run_id = base_run_id + ("_screen" if stage == "screen" else "")
-    container_evaloutput_folder = os.path.join(container_output_folder, eval_run_id)
+    container_evaloutput_folder = posixpath.join(container_output_folder, eval_run_id)
     local_output = os.path.join(gen_output_dir, eval_run_id)
     os.makedirs(local_output, exist_ok=True)
 
@@ -342,7 +343,7 @@ def eval_produced_agent(
     try:
         # Seed the full training run with all screening artifacts. The harness
         # resumes predictions by ID, including failed attempts marked "None".
-        screen_dir = os.path.join(container_output_folder, f"{domain}_eval_screen")
+        screen_dir = posixpath.join(container_output_folder, f"{domain}_eval_screen")
         if stage == "full" and split == "train" and os.path.exists(
             os.path.join(gen_output_dir, f"{domain}_eval_screen", "predictions.csv")
         ):
@@ -404,8 +405,8 @@ def copy_prev_eval_to_container(
 
     # Normalize and construct destination path in container
     prev_eval_path = os.path.normpath(prev_eval_path)
-    tail = os.path.join(*prev_eval_path.split(os.sep)[-1:])
-    container_prev_eval_path = os.path.join(container_output_folder, tail)
+    tail = os.path.basename(prev_eval_path)
+    container_prev_eval_path = posixpath.join(container_output_folder, tail)
 
     # Ensure destination parent exists
     container.exec_run(["mkdir", "-p", container_output_folder], workdir="/")
@@ -453,7 +454,7 @@ def copy_prev_eval_to_container(
 
     # Move the folder to a new name
     if container_folder_name is not None:
-        new_container_prev_eval_path = os.path.join(
+        new_container_prev_eval_path = posixpath.join(
             container_output_folder, container_folder_name
         )
         container.exec_run(
@@ -569,7 +570,7 @@ def generate(
 
                 # Copy previous generations to container
                 if run_baseline == "no_archive":
-                    container_prev_eval_path = os.path.join(
+                    container_prev_eval_path = posixpath.join(
                         container_output_folder, *prev_gen_dir.split(os.sep)[-2:]
                     )
                     copy_to_container(
@@ -584,10 +585,10 @@ def generate(
 
             # Run meta agent
             safe_log("Running meta agent...")
-            container_agentoutput_folder = os.path.join(
+            container_agentoutput_folder = posixpath.join(
                 container_output_folder, "agent_output"
             )
-            container_chat_history_file = os.path.join(
+            container_chat_history_file = posixpath.join(
                 container_agentoutput_folder, "meta_agent_chat_history.md"
             )
             if run_baseline and "dgm" in run_baseline:

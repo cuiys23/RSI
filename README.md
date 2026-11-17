@@ -56,6 +56,27 @@ python generate_loop.py --domains <domain>
 
 By default, outputs will be saved in `outputs/` directory.
 
+## IMO grading setup
+
+For the grading coursework, install the dedicated CPU dependencies and image:
+
+```bash
+pip install -r requirements_imo_grading.txt
+docker build -f Dockerfile.imo_grading -t hyperagents-imo-grading-v2 .
+python -m domains.imo.curate_subsets
+python -m generate_loop --domains imo_grading --max_generation 30
+```
+
+The grading loop selects `Dockerfile.imo_grading` automatically and builds the
+image if needed. It does not require CUDA, the proofgrader repository, game
+environments, or the research cluster's build proxy. On Windows, use Docker
+Desktop with Linux containers. Graphviz/pygraphviz are optional for plotting;
+without them the evolution tree uses the built-in layered layout.
+
+Each initial agent copy has its own Git repository and baseline commit.
+Linux container paths are kept separate from Windows host paths when copying
+feedback and exporting logs and patches.
+
 ## IMO grading experiment records
 
 Each attempt keeps its existing generation ID (`gen_0`, `gen_1`, ...,

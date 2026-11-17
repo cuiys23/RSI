@@ -47,6 +47,20 @@ class GenerationFailureTests(unittest.TestCase):
             self.assertFalse(result['valid_parent'])
             self.assertEqual(result['parent_genid'], 0)
 
+    def test_meta_command_and_exports_use_linux_container_paths(self):
+        container = Mock()
+        container.exec_run.return_value = SimpleNamespace(exit_code=0, output=b'')
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('generate_loop.copy_prev_eval_to_container', return_value='/tmp/feedback'):
+            self.run_generation(directory, container)
+        command = next(call.kwargs['cmd'] for call in container.exec_run.call_args_list
+                       if isinstance(call.kwargs.get('cmd'), list)
+                       and 'run_meta_agent.py' in call.kwargs['cmd'])
+        self.assertEqual(command[command.index('--chat_history_file') + 1],
+                         '/tmp/agent_output/meta_agent_chat_history.md')
+        self.assertEqual(command[command.index('--outdir') + 1], '/tmp/agent_output')
+        self.assertEqual(command[command.index('--evals_folder') + 1], '/tmp/feedback')
+
 
 if __name__ == '__main__':
     unittest.main()

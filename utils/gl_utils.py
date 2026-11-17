@@ -9,6 +9,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 
 import numpy as np
 
@@ -268,7 +269,11 @@ def setup_initial_gen(
     # Resume from previous run
     if resume:
         root_dir = os.path.abspath(os.path.join(output_dir, f"gen_initial/{REPO_NAME}"))
+        if not os.path.isdir(os.path.join(root_dir, ".git")):
+            raise ValueError("Cannot resume: initial agent has no independent Git repository")
         commit_hash = get_git_commit_hash(root_dir)
+        if commit_hash is None:
+            raise ValueError("Cannot resume: initial agent has no valid Git commit")
         return root_dir, commit_hash
 
     # Make a copy of the eval folder
@@ -414,8 +419,21 @@ def setup_initial_gen(
         os.remove(os.path.join(root_dir, "meta_agent.py"))
         os.remove(os.path.join(root_dir, "run_meta_agent.py"))
 
-    # Get commit hash
-    commit_hash = commit_repo(root_dir)
+    # The sanitized copy has no .git. Initialize it before any Git operation so
+    # Git cannot discover (and commit changes in) the enclosing project repo.
+    subprocess.run(
+        ["git", "-C", root_dir, "init", "--initial-branch=main"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", root_dir, "config", "core.autocrlf", "false"],
+        check=True, capture_output=True, text=True,
+    )
+    if commit_repo(root_dir) is None:
+        raise RuntimeError("Failed to commit the initial agent repository")
+    commit_hash = get_git_commit_hash(root_dir)
+    if commit_hash is None:
+        raise RuntimeError("Failed to read the initial agent commit")
 
     # Return info
     return root_dir, commit_hash

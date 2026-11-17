@@ -1,10 +1,12 @@
 import io
 import logging
 import os
+import shutil
 import tarfile
+import tempfile
 import threading
 import warnings
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Union
 
 import docker
@@ -110,13 +112,17 @@ def build_container(
     verbose=True,
 ):
     """
-    Build the Docker image with proxy and host networking, then run it interactively.
+    Build the domain's Docker image, then start its agent workspace.
     """
+    grading_only = bool(domains) and set(domains) == {"imo_grading"}
+    dockerfile = "Dockerfile.imo_grading" if grading_only else "Dockerfile"
     if domains and "imo_grading" in domains:
         # Separate image namespace prevents reuse of old data-bearing images.
-        image_name = image_name + "-imo-sanitized-v1"
+        image_name += "-imo-grading-v2" if grading_only else "-imo-sanitized-v1"
         if not os.path.exists(os.path.join(repo_path, ".dockerignore")):
             raise ValueError("Sanitized IMO image requires .dockerignore")
+    if grading_only and not os.path.isfile(os.path.join(repo_path, dockerfile)):
+        raise ValueError(f"IMO grading image requires {dockerfile}")
     try:
         # Set up proxy environment
         proxy_env = {
@@ -132,17 +138,21 @@ def build_container(
         )
         if force_rebuild or not image_exists:
             safe_log(
-                "Building the Docker image with proxy and host networking...",
+                f"Building the Docker image with {dockerfile}...",
                 verbose=verbose,
             )
-            image, logs = client.images.build(
-                path=repo_path,  # <-- This points to the directory containing Dockerfile
+            build_kwargs = dict(
+                path=repo_path,
+                dockerfile=dockerfile,
                 tag=image_name,
                 rm=True,
-                network_mode="host",
                 nocache=force_rebuild,
-                buildargs=proxy_env,
             )
+            # Grading works on ordinary Docker/Desktop networks without the
+            # research cluster's private proxy or host-build-network setup.
+            if not grading_only:
+                build_kwargs.update(network_mode="host", buildargs=proxy_env)
+            image, logs = client.images.build(**build_kwargs)
             for log_entry in logs:
                 if "stream" in log_entry:
                     safe_log(log_entry["stream"].strip())
@@ -359,7 +369,7 @@ def create_archive(path: Union[str, Path], data: Optional[bytes] = None) -> byte
             arcname = path.name
             for item in path.rglob("*"):
                 tarinfo = tar.gettarinfo(
-                    str(item), arcname=str(item.relative_to(path.parent))
+                    str(item), arcname=item.relative_to(path.parent).as_posix()
                 )
                 tarinfo.uid = 0
                 tarinfo.gid = 0
@@ -388,7 +398,7 @@ def copy_to_container(
         Exception: For other errors during copy operation
     """
     source_path = Path(source_path)
-    dest_path = Path(dest_path)
+    dest_path = PurePosixPath(os.fspath(dest_path).replace("\\", "/"))
 
     try:
         if not source_path.exists():
@@ -426,7 +436,7 @@ def copy_to_container(
         tar_stream.seek(0)
 
         # Ensure destination directory exists in container
-        container.exec_run(f"mkdir -p {container_dest_dir}")
+        log_container_output(container.exec_run(["mkdir", "-p", container_dest_dir]), verbose=verbose)
 
         # Pass the file-like object (stream) to put_archive
         success = container.put_archive(container_dest_dir, tar_stream)
@@ -459,26 +469,19 @@ def copy_from_container(
         FileNotFoundError: If source path doesn't exist in container
         Exception: For other errors during copy operation
     """
-    source_path = Path(source_path)
+    source_path = PurePosixPath(os.fspath(source_path).replace("\\", "/"))
     dest_path = Path(dest_path)
 
     try:
-        # Check if source exists in container
-        result = container.exec_run(f"test -e {source_path}")
-        if result.exit_code and result.exit_code != 0:
-            raise FileNotFoundError(
-                f"Source path not found in container: {source_path}"
-            )
-
-        # Get file type from container
-        result = container.exec_run(f"stat -f '%HT' {source_path}")
-        is_file = result.output.decode().strip() == "Regular File"
-
         # Create destination directory if it doesn't exist
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Get archive from container
-        bits, stat = container.get_archive(str(source_path))
+        # Docker already supplies the archive and its root name. Avoid host
+        # Path conversion and platform-specific shell/stat commands entirely.
+        try:
+            bits, stat = container.get_archive(str(source_path))
+        except docker.errors.NotFound as error:
+            raise FileNotFoundError(f"Source path not found in container: {source_path}") from error
 
         # Concatenate all chunks into a single bytes object
         archive_data = b"".join(bits)
@@ -486,24 +489,17 @@ def copy_from_container(
         # Extract to temporary stream
         stream = io.BytesIO(archive_data)
 
-        with tarfile.open(fileobj=stream, mode="r") as tar:
-            # If extracting a single file
-            if is_file:
-                member = tar.getmembers()[0]
-                source_file = tar.extractfile(member)
-                if source_file is not None:
-                    with source_file:
-                        data = source_file.read()
-                        # Write directly to destination file
-                        with open(dest_path, "wb") as dest_file:
-                            dest_file.write(data)
+        with tempfile.TemporaryDirectory(prefix="rsi-export-") as temporary:
+            with tarfile.open(fileobj=stream, mode="r") as tar:
+                tar.extractall(path=temporary, filter="data")
+            extracted_path = Path(temporary) / PurePosixPath(stat["name"]).name
+            if extracted_path.is_file():
+                shutil.copy2(extracted_path, dest_path)
+            elif extracted_path.is_dir():
+                # Repeated exports merge into an existing generation record.
+                shutil.copytree(extracted_path, dest_path, dirs_exist_ok=True)
             else:
-                # For directories, extract to parent directory
-                tar.extractall(path=str(dest_path.parent))
-                # Rename if necessary
-                extracted_path = dest_path.parent / Path(stat["name"]).name
-                if extracted_path != dest_path and extracted_path.exists():
-                    extracted_path.rename(dest_path)
+                raise FileNotFoundError(f"Container archive has no root entry: {stat['name']}")
 
         safe_log(
             f"Successfully copied from container {source_path} to local path {dest_path}",

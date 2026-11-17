@@ -6,10 +6,10 @@ import subprocess
 def get_git_commit_hash(repo_path='.'):
     try:
         # Load the repository
-        repo = git.Repo(repo_path)
-        # Get the current commit hash
-        commit_hash = repo.head.commit.hexsha
-        return commit_hash
+        # Close GitPython's helper processes so Windows can release the copied
+        # repository directory after evaluation or test cleanup.
+        with git.Repo(repo_path) as repo:
+            return repo.head.commit.hexsha
     except Exception as e:
         print("Error while getting git commit hash:", e)
         return None
