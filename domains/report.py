@@ -27,9 +27,22 @@ def report(
     # Load and process the data
     path = os.path.join(dname, f"predictions{suffix}.csv")
     df = pd.read_csv(path, dtype=str)
-    df = df[df["prediction"] != ""].copy()  # Filter out rows with NA predictions
-    df["prediction"] = df["prediction"].str.strip().str.lower()
-    df[ground_truth_key] = df[ground_truth_key].str.strip().str.lower()
+    if domain == "imo_grading":
+        from domains.imo.grading_utils import normalize_points
+        truth = df[ground_truth_key].map(normalize_points)
+        if truth.isna().any():
+            raise ValueError("IMO grading ground truth must be one of 0, 1, 6, 7")
+        predictions = df["prediction"].map(normalize_points)
+        df["prediction_points"] = predictions
+        df["reward_points"] = truth
+        df[ground_truth_key] = truth.map(lambda x: str(int(x)))
+        df["prediction"] = predictions.map(
+            lambda x: str(int(x)) if pd.notna(x) else "invalid"
+        )
+    else:
+        df = df[df["prediction"] != ""].copy()
+        df["prediction"] = df["prediction"].str.strip().str.lower()
+        df[ground_truth_key] = df[ground_truth_key].str.strip().str.lower()
     df["match"] = df[ground_truth_key] == df["prediction"]
 
     # Calculate overall accuracy
@@ -38,28 +51,11 @@ def report(
     total = len(df)
     print(f"Accuracy: {accuracy:.3f}, Total correct: {total_correct} / {total}")
 
-    # Calculate Mean Absolute Error (MAE)
+    # Invalid predictions remain in the denominator and receive maximum MAE.
     if domain == "imo_grading":
-        try:
-            max_error = 7
-            df["prediction_points"] = (
-                df["prediction"]
-                .map({"incorrect": 0, "partial": 1, "almost": 6, "correct": 7})
-                .astype(float)
-            )
-            df['reward_points'] = (
-                df[ground_truth_key]
-                .map({"incorrect": 0, "partial": 1, "almost": 6, "correct": 7})
-                .astype(float)
-            )
-            df["error"] = abs(df["prediction_points"] - df['reward_points'])
-            df["error"] = df["error"].fillna(max_error)
-            mae = df["error"].mean() / max_error
-            print(f"Normalized Mean Absolute Error (MAE): {mae:.3f}")
-        except Exception as e:
-            mae = None
-            print("Error: Could not calculate MAE for IMO grading")
-            print(e)
+        errors = (df["prediction_points"] - df["reward_points"]).abs().fillna(7)
+        mae = float(errors.mean() / 7)
+        print(f"Normalized Mean Absolute Error (MAE): {mae:.3f}")
 
     # Accuracy by label
     label_accuracies = df.groupby(ground_truth_key)["match"].mean()

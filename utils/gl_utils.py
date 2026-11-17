@@ -29,14 +29,55 @@ def is_starting_node(genid):
     return genid == "initial" or genid == 0
 
 
+def get_full_validation_score(domain, output_dir, genid):
+    """Only a complete, successful 100-example IMO validation run is eligible."""
+    import csv
+    folder = os.path.join(output_dir, f"gen_{genid}", f"{domain}_eval_val")
+    try:
+        metadata_path = os.path.join(output_dir, f"gen_{genid}", "metadata.json")
+        metadata = {}
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as stream:
+                metadata = json.load(stream)
+        if metadata.get("evaluation_error") or metadata.get("screening_rejected"):
+            return None
+        if metadata.get("parent_agent_success") is False:
+            return None
+        status_path = os.path.join(folder, "stage_status.json")
+        if os.path.exists(status_path):
+            with open(status_path) as stream:
+                status = json.load(stream)
+            if not status.get("success") or status.get("stage") != "full" or status.get("split") != "val":
+                return None
+        elif not is_starting_node(genid):
+            return None
+        with open(os.path.join(folder, "report.json")) as stream:
+            report = json.load(stream)
+        with open(os.path.join(folder, "predictions.csv"), newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        ids = [row["Grading ID"] for row in rows]
+        score = report["overall_accuracy"]
+        correct = report["total_correct"]
+        if (len(rows) != 100 or len(set(ids)) != 100 or any(not qid for qid in ids)
+                or report["total"] != 100 or type(correct) is not int
+                or not 0 <= correct <= 100 or not math.isfinite(score)
+                or not math.isclose(score, correct / 100)):
+            return None
+        return score
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def get_saved_score(domain, output_dir, genid, split="train", type="agent"):
+    if domain == "imo_grading" and split == "val":
+        return get_full_validation_score(domain, output_dir, genid)
     # Type can be "agent" or "ensemble" or "max"
     agent_score = get_score(domain, output_dir, genid, split=split)
     ensemble_score = get_saved_ensemble_score(domain, output_dir, genid, split=split)
 
     # If full eval is not run, adjust score
     run_full_eval = get_node_metadata_key(output_dir, genid, "run_full_eval")
-    if genid == "initial" or (run_full_eval is None or not run_full_eval):
+    if not run_full_eval:
         stagedeval_frac = get_domain_stagedeval_frac(domain)
         agent_score = agent_score * stagedeval_frac if agent_score is not None else None
         ensemble_score = (
@@ -518,6 +559,8 @@ def select_parent(archive, output_dir, domains, method="best"):
             if not is_starting_node(genid)
             else True
         )
+        if "imo_grading" in domains:
+            valid_parent = get_full_validation_score("imo_grading", output_dir, genid) is not None
         if not valid_parent:
             continue
         # Get per-domain scores
@@ -530,6 +573,8 @@ def select_parent(archive, output_dir, domains, method="best"):
             candidates[genid] = sum(per_domain_scores) / len(per_domain_scores)
 
     if not candidates:
+        if "imo_grading" in domains:
+            raise ValueError("No eligible parent with complete 100-example validation results")
         # Get the first initial node as the only candidate
         candidates[archive[0]] = 0.0
         # raise ValueError("No evaluation results found in archive.")

@@ -34,6 +34,7 @@ from utils.gl_utils import (
     apply_diffs_container,
     get_patch_files,
     get_score,
+    get_full_validation_score,
     load_archive_data,
     run_commands_to_check_compilation,
     select_parent,
@@ -300,64 +301,82 @@ def get_ensemble_scores_container(
 
 
 def eval_produced_agent(
-    container,
-    container_output_folder,
-    gen_output_dir,
-    domain,
-    eval_samples=-1,
-    eval_workers=10,
-    eval_subset="_filtered_100_train",
-    eval_test=False,
+    container, container_output_folder, gen_output_dir, domain,
+    eval_samples=-1, eval_workers=10, eval_subset="_filtered_100_train",
+    split="train", stage="full",
 ):
-    # Evaluate the produced agent
-    splits = get_domain_splits(domain, eval_test=eval_test)
-    for split in splits:  # pyright: ignore
-        safe_log(f"Evaluating the produced agent on {domain} {eval_samples} {split}...")
-        eval_run_id = f"{domain}_eval" if split == "train" else f"{domain}_eval_{split}"
-        container_evaloutput_folder = os.path.join(container_output_folder, eval_run_id)
-        command = [
-            "timeout",
-            "18000",  # 5h timeout
-            "python",
-            "-m",
-            "domains.harness",
-            "--agent_path",
-            "./task_agent.py",
-            "--output_dir",
-            container_output_folder,
-            "--run_id",
-            eval_run_id,
-            "--domain",
-            domain,
-            "--num_samples",
-            str(eval_samples),
-            "--num_workers",
-            str(eval_workers),
-            "--subset",
-            eval_subset.replace("_train", f"_{split}"),
-        ]
-        exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
-        log_container_output(exec_result)
-        command = [
-            "timeout",
-            "10800",  # 3h timeout
-            "python",
-            "-m",
-            "domains.report",
-            "--domain",
-            domain,
-            "--dname",
-            os.path.join(container_output_folder, eval_run_id),
-        ]
-        exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
-        log_container_output(exec_result)
-        # Copy container outputs to local, evaluation results
-        evaloutput_folder = os.path.join(gen_output_dir, eval_run_id)
-        copy_from_container(
-            container,
-            source_path=container_evaloutput_folder,
-            dest_path=evaloutput_folder,
-        )
+    """Evaluate exactly one split; keep screening artifacts separate."""
+    if stage not in {"screen", "full"} or split not in {"train", "val", "test"}:
+        raise ValueError(f"Invalid evaluation stage/split: {stage}/{split}")
+    if stage == "screen" and split != "train":
+        raise ValueError("Screening may only evaluate training examples")
+    if domain == "imo_grading":
+        if split == "test":
+            raise ValueError("Test-set evaluation is disabled for IMO grading search")
+        eval_samples = 10 if stage == "screen" else 100
+    base_run_id = f"{domain}_eval" if split == "train" else f"{domain}_eval_{split}"
+    eval_run_id = base_run_id + ("_screen" if stage == "screen" else "")
+    container_evaloutput_folder = os.path.join(container_output_folder, eval_run_id)
+    local_output = os.path.join(gen_output_dir, eval_run_id)
+    os.makedirs(local_output, exist_ok=True)
+
+    def checked(command):
+        result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
+        log_container_output(result)
+        if result.exit_code != 0:
+            raise RuntimeError(f"{domain}/{split}/{stage}: exit {result.exit_code}: {result.output!r}")
+        return result
+
+    try:
+        # Seed the full training run with all screening artifacts. The harness
+        # resumes predictions by ID, including failed attempts marked "None".
+        screen_dir = os.path.join(container_output_folder, f"{domain}_eval_screen")
+        if stage == "full" and split == "train" and os.path.exists(
+            os.path.join(gen_output_dir, f"{domain}_eval_screen", "predictions.csv")
+        ):
+            checked(["mkdir", "-p", container_evaloutput_folder])
+            checked(["cp", "-a", screen_dir + "/.", container_evaloutput_folder])
+        subset = eval_subset.replace("_train", f"_{split}")
+        checked([
+            "timeout", "18000", "python", "-m", "domains.harness",
+            "--agent_path", "./task_agent.py", "--output_dir", container_output_folder,
+            "--run_id", eval_run_id, "--domain", domain,
+            "--num_samples", str(eval_samples), "--num_workers", str(eval_workers),
+            "--subset", subset,
+        ])
+        checked([
+            "timeout", "10800", "python", "-m", "domains.report",
+            "--domain", domain, "--dname", container_evaloutput_folder,
+        ])
+        copy_from_container(container, source_path=container_evaloutput_folder,
+                            dest_path=local_output)
+        report_path = os.path.join(local_output, "report.json")
+        with open(report_path) as stream:
+            report = json.load(stream)
+        # CSV domains must preserve every requested sample and unique ID.
+        if domain == "imo_grading" or domain in {"paper_review", "search_arena"}:
+            import csv
+            from importlib import import_module
+            module_name = "domains.imo.grading_utils" if domain == "imo_grading" else f"domains.{domain}.utils"
+            id_key = import_module(module_name).QUESTION_ID
+            with open(os.path.join(local_output, "predictions.csv"), newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            ids = [row[id_key] for row in rows]
+            if len(set(ids)) != len(ids) or any(not qid for qid in ids):
+                raise ValueError("Prediction IDs must be unique and nonempty")
+            if eval_samples > 0 and len(rows) != eval_samples:
+                raise ValueError(f"Expected {eval_samples} predictions, got {len(rows)}")
+            if report["total"] != len(rows):
+                raise ValueError("Report denominator does not match prediction count")
+        with open(os.path.join(local_output, "stage_status.json"), "w") as stream:
+            json.dump({"stage": stage, "split": split, "success": True}, stream)
+        return report
+    except Exception as error:
+        with open(os.path.join(local_output, "stage_status.json"), "w") as stream:
+            json.dump({"stage": stage, "split": split, "success": False,
+                       "error": str(error)}, stream, indent=2)
+        raise RuntimeError(f"Evaluation failed ({domain}/{split}/{stage}): {error}") from error
+
 
 
 def copy_prev_eval_to_container(
@@ -621,71 +640,63 @@ def generate(
         if run_eval and "agent" in optimize_option:
             log_path = os.path.join(gen_output_dir, "generate.log")
 
-            def eval_agent_worker(domain, eval_subset, eval_n):
-                setup_logger(log_path)  # Re-setup logger because of threading
-                eval_produced_agent(
-                    container,
-                    container_output_folder,
-                    gen_output_dir,
-                    domain=domain,
-                    eval_samples=eval_n,
-                    eval_workers=eval_workers,
-                    eval_subset=eval_subset,
-                    eval_test=eval_test,
+            def eval_agent_worker(domain, subset, count, split, stage):
+                setup_logger(log_path)
+                return eval_produced_agent(
+                    container, container_output_folder, gen_output_dir,
+                    domain=domain, eval_samples=count, eval_workers=eval_workers,
+                    eval_subset=subset, split=split, stage=stage,
                 )
 
-            # Small sample size evaluation for staged eval
+            metadata["run_full_eval"] = False
+            metadata["screening"] = {}
+            run_next_eval = True
             if not skip_staged_eval:
-                stagedeval_samples = [
-                    get_domain_stagedeval_samples(domain) for domain in domains
-                ]
                 with ThreadPoolExecutor() as executor:
-                    futures = [
-                        executor.submit(eval_agent_worker, d, s, n)
-                        for d, s, n in zip(domains, eval_subsets, stagedeval_samples)
-                    ]
-                    try:
-                        for f in futures:
-                            f.result()
-                    except Exception as e:
-                        # Cancel all other futures if any job fails
-                        for future in futures:
-                            if not future.done():
-                                future.cancel()
-                        raise
-                stagedeval_scores = [
-                    get_score(domain, output_dir, current_genid) for domain in domains
-                ]
-                run_next_eval = all(
-                    [x is not None and x > 0 for x in stagedeval_scores]
-                )
-            else:
-                run_next_eval = True
-
-            # Full evaluation
-            if run_next_eval:
-                _per_domain_eval_samples = eval_samples
-                with ThreadPoolExecutor() as executor:
-                    futures = [
-                        executor.submit(eval_agent_worker, d, s, n)
-                        for d, s, n in zip(
-                            domains, eval_subsets, _per_domain_eval_samples
+                    futures = {
+                        domain: executor.submit(
+                            eval_agent_worker, domain, subset,
+                            get_domain_stagedeval_samples(domain), "train", "screen",
                         )
+                        for domain, subset in zip(domains, eval_subsets)
+                    }
+                    for domain, future in futures.items():
+                        report = future.result()
+                        if "total_correct" in report:
+                            passed = report["total_correct"] >= 1
+                        else:
+                            from utils.domain_utils import get_domain_score_key
+                            passed = report[get_domain_score_key(domain)] > 0
+                        metadata["screening"][domain] = {
+                            "passed": passed, "total_correct": report.get("total_correct"),
+                        }
+                        run_next_eval = run_next_eval and passed
+                metadata["screening_rejected"] = not run_next_eval
+                if not run_next_eval:
+                    metadata["run_eval"] = False
+                    safe_log("Screening rejected: at least one domain failed the training gate")
+
+            if run_next_eval:
+                counts = eval_samples if isinstance(eval_samples, (list, tuple)) else [eval_samples] * len(domains)
+                # Complete training before any validation evaluation begins.
+                for split in ("train", "val", "test"):
+                    jobs = [
+                        (domain, subset, count)
+                        for domain, subset, count in zip(domains, eval_subsets, counts)
+                        if split in get_domain_splits(domain, eval_test=eval_test)
+                        and not (domain == "imo_grading" and split == "test")
                     ]
-                    try:
-                        for f in futures:
-                            f.result()
-                    except Exception as e:
-                        # Cancel all other futures if any job fails
+                    with ThreadPoolExecutor() as executor:
+                        futures = [executor.submit(eval_agent_worker, d, s, n, split, "full")
+                                   for d, s, n in jobs]
                         for future in futures:
-                            if not future.done():
-                                future.cancel()
-                        raise
+                            future.result()
                 metadata["run_full_eval"] = True
 
     except Exception as e:
         safe_log(f"Error in generate: {e}")
         metadata["run_eval"] = False
+        metadata["evaluation_error"] = str(e)
 
     # Even on errors or KeyboardInterrupt
     finally:
@@ -709,7 +720,14 @@ def generate(
                 for domain in domains
             ]
         )
-        metadata["valid_parent"] = metadata["run_eval"] and (eval_successful or meta_patch_files is not None)
+        if "imo_grading" in domains:
+            metadata["valid_parent"] = bool(
+                metadata["parent_agent_success"] and metadata["run_eval"]
+                and metadata.get("run_full_eval", False)
+                and get_full_validation_score("imo_grading", output_dir, current_genid) is not None
+            )
+        else:
+            metadata["valid_parent"] = metadata["run_eval"] and (eval_successful or meta_patch_files is not None)
         with open(os.path.join(gen_output_dir, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=4)
 
@@ -925,7 +943,7 @@ def generate_loop(
         archive = update_and_save_archive(output_dir, archive, new_node=current_genid)
 
         # Parent agent failed, update the metadata in the parent node
-        if not metadata["parent_agent_success"]:
+        if not metadata["parent_agent_success"] and "imo_grading" not in domains:
             update_node_metadata(output_dir, parent_genid, {"valid_parent": False})
 
         # Evaluate the agent on polyglot if needed
@@ -1018,6 +1036,16 @@ def generate_loop(
 
         print(f"generate_loop: generation {current_genid} completed, parent {parent_genid}")
 
+    # Best-agent selection uses complete validation accuracy, never training
+    # scores or child-count penalties. Every attempted node stays in archive.
+    if "imo_grading" in domains:
+        scores = {node: get_full_validation_score("imo_grading", output_dir, node)
+                  for node in archive}
+        eligible = {node: score for node, score in scores.items() if score is not None}
+        best = max(eligible, key=eligible.get) if eligible else None
+        with open(os.path.join(output_dir, "best_agent.json"), "w") as stream:
+            json.dump({"genid": best, "validation_accuracy": eligible.get(best),
+                       "metric": "overall_accuracy", "split": "val"}, stream, indent=2)
     # Return output dir
     return output_dir
 

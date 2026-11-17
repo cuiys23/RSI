@@ -131,7 +131,7 @@ BASH
 # Set the working directory inside the container
 WORKDIR /hyperagents
 
-# Copy the entire repository into the container
+# Copy code only; .dockerignore excludes datasets, histories and secrets.
 COPY . .
 
 # Install Python dependencies

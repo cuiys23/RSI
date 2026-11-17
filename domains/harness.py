@@ -68,6 +68,7 @@ def harness(
     resume_from=None,
     subset="",
     proofs_dname=None,
+    task_model=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -76,7 +77,7 @@ def harness(
     utils_module = importlib.import_module(utils_module_path)
     format_input_dict = utils_module.format_input_dict
     question_id_col = utils_module.QUESTION_ID
-    model = utils_module.MODEL
+    model = task_model or os.environ.get("RSI_FIXED_MODEL") or utils_module.MODEL
 
     # Load TaskAgent either from a file path or an importable module path
     TaskAgent = load_task_agent(agent_path)
@@ -97,9 +98,9 @@ def harness(
 
     # Load existing predictions if available
     if os.path.exists(output_path):
-        existing_df = pd.read_csv(output_path, dtype=str)
+        existing_df = pd.read_csv(output_path, dtype=str, keep_default_na=False)
         completed_ids = set(
-            existing_df[~existing_df["prediction"].isna()][question_id_col]
+            existing_df[existing_df["prediction"].notna() & existing_df["prediction"].ne("")][question_id_col]
         )
     else:
         existing_df = None
@@ -129,7 +130,7 @@ def harness(
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         for i, row in dataset.iterrows():
             if (
-                pd.notna(row["prediction"]) or row[question_id_col] in completed_ids
+                (pd.notna(row["prediction"]) and row["prediction"] != "") or row[question_id_col] in completed_ids
             ):  # pyright: ignore
                 continue
             futures.append(

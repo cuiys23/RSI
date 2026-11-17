@@ -1,0 +1,12 @@
+﻿.git
+.env
+**/.env
+outputs*
+**/__pycache__
+.venv
+venv*
+**/*.csv
+**/*.jsonl
+**/grading_split_ids.json
+**/*test*.json
+**/*.pdf

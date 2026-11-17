@@ -1,3 +1,5 @@
+from utils.experiment import record_usage
+
 import backoff
 import os
 from typing import Tuple
@@ -40,6 +42,8 @@ def get_response_from_llm(
     max_tokens: int = MAX_TOKENS,
     msg_history=None,
 ) -> Tuple[str, list, dict]:
+    # The launcher fixes the model independently of editable Agent arguments.
+    model = os.environ.get("RSI_FIXED_MODEL", model)
     if msg_history is None:
         msg_history = []
 
@@ -74,7 +78,17 @@ def get_response_from_llm(
         else:
             completion_kwargs["max_tokens"] = max_tokens
 
-    response = litellm.completion(**completion_kwargs)
+    try:
+        response = litellm.completion(**completion_kwargs)
+    except Exception as error:
+        record_usage(dict(requested_model=model, actual_model=None, status="error",
+                          error=str(error), input_tokens=None, output_tokens=None))
+        raise
+    usage = response.get("usage") or {}
+    info = dict(requested_model=model, actual_model=response.get("model"), status="success",
+                input_tokens=usage.get("prompt_tokens", usage.get("input_tokens")),
+                output_tokens=usage.get("completion_tokens", usage.get("output_tokens")))
+    record_usage(info)
     response_text = response['choices'][0]['message']['content']  # pyright: ignore
     new_msg_history.append({"role": "assistant", "content": response['choices'][0]['message']['content']})
 
@@ -84,7 +98,7 @@ def get_response_from_llm(
         for msg in new_msg_history
     ]
 
-    return response_text, new_msg_history, {}
+    return response_text, new_msg_history, info
 
 
 if __name__ == "__main__":

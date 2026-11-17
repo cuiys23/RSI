@@ -1,2 +1,19 @@
 outputs/
 outputs_os/
+
+# Datasets downloaded/generated at runtime (see domains/imo/setup.sh)
+domains/imo/*bench*.csv
+domains/search_arena/dataset*.csv
+domains/paper_review/dataset_filtered_*.csv
+domains/polyglot/polyglot_benchmark_metadata.json
+domains/polyglot/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv*/
+*.egg-info/
+
+# Secrets
+.env
