@@ -22,17 +22,20 @@ from utils.domain_utils import (
     get_domain_stagedeval_frac,
 )
 from utils.git_utils import commit_repo, get_git_commit_hash
+from utils.generation_records import evaluation_directory
 
 
 def is_starting_node(genid):
     # Starting nodes are initial or 0
-    return genid == "initial" or genid == 0
+    return genid == "initial" or genid == 0 or genid == "0"
 
 
 def get_full_validation_score(domain, output_dir, genid):
     """Only a complete, successful 100-example IMO validation run is eligible."""
     import csv
-    folder = os.path.join(output_dir, f"gen_{genid}", f"{domain}_eval_val")
+    from utils.generation_records import evaluation_directory
+    folder = str(evaluation_directory(os.path.join(output_dir, f"gen_{genid}"), domain,
+                                      "val", existing=True))
     try:
         metadata_path = os.path.join(output_dir, f"gen_{genid}", "metadata.json")
         metadata = {}
@@ -105,8 +108,9 @@ def get_saved_score(domain, output_dir, genid, split="train", type="agent"):
 
 def get_score(domain, output_dir, genid, split="train"):
     # Get score from eval file
-    eval_dirname = f"{domain}_eval" if split == "train" else f"{domain}_eval_{split}"
-    eval_file = os.path.join(output_dir, f"gen_{genid}/{eval_dirname}/report.json")
+    folder = evaluation_directory(os.path.join(output_dir, f"gen_{genid}"), domain,
+                                  split, existing=True)
+    eval_file = folder / "report.json"
     score_key = get_domain_score_key(domain)
     try:
         with open(eval_file, "r") as f:
@@ -270,6 +274,8 @@ def setup_initial_gen(
     # Make a copy of the eval folder
     if copy_eval:
         for domain, subset in zip(domains, subsets):
+            if domain == "imo_grading":
+                continue  # Baseline is evaluated as round 0 with the fixed model.
             splits = get_domain_splits(domain, eval_test=eval_test)
             # Eval on training set
             gen_output_dir = os.path.join(output_dir, f"gen_initial/{domain}_eval")
@@ -308,6 +314,7 @@ def setup_initial_gen(
     # Define exclusion criteria
     excluded_dirs = {
         ".claude",
+        ".git",
         "outputs",
         "analysis",
         "misc",
@@ -315,8 +322,6 @@ def setup_initial_gen(
         "domains",
     }
     excluded_files = {
-        "Dockerfile",
-        ".dockerignore",
         "setup_initial.sh",
         "LICENSE.md",
         "CODE_OF_CONDUCT.md",
@@ -354,7 +359,10 @@ def setup_initial_gen(
         for name in names:
             full_path = os.path.join(src, name)
             rel = os.path.relpath(full_path, start=source_root).replace(os.sep, "/")
-            if any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in excluded_dirs):
+            if (os.path.isfile(full_path) and (name.endswith((".csv", ".jsonl", ".pdf"))
+                    or name == ".env" or name == "grading_split_ids.json")):
+                ignored.append(name)
+            elif any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in excluded_dirs):
                 ignored.append(name)
             elif name in excluded_files and os.path.isfile(full_path):
                 ignored.append(name)
@@ -370,7 +378,9 @@ def setup_initial_gen(
         for name in names:
             full_path = os.path.join(src, name)
             rel = os.path.relpath(full_path, start=source_root_domains).replace(os.sep, "/")
-            if any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in excluded_dirs_domains):
+            if name.endswith((".csv", ".jsonl")) or name == "grading_split_ids.json":
+                ignored.append(name)
+            elif any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in excluded_dirs_domains):
                 ignored.append(name)
             elif name in excluded_files_domains and os.path.isfile(full_path):
                 ignored.append(name)
@@ -482,7 +492,11 @@ def apply_diffs_container(container, patch_files, repo_name=REPO_NAME, verbose=T
     for patch_file in patch_files:
         # Read and filter the patch to exclude domains/ folder changes
         patch_content = read_file(patch_file)
-        filtered_patch = filter_patch_by_files(patch_content, ["domains/"])
+        filtered_patch = filter_patch_by_files(patch_content, [
+            "domains/", "agent/llm.py", "utils/experiment.py", "generate_loop.py",
+            "run_meta_agent.py", "utils/gl_utils.py", "utils/docker_utils.py",
+            "utils/generation_records.py",
+        ])
 
         # Write filtered patch to a temporary file
         import tempfile

@@ -45,8 +45,9 @@ def setup_logger(log_file):
     logger.setLevel(logging.INFO)
 
     # Clear existing handlers
-    for handler in logger.handlers:
+    for handler in list(logger.handlers):
         logger.removeHandler(handler)
+        handler.close()
 
     # Create file handler with lock
     handler = logging.FileHandler(log_file)
@@ -111,6 +112,11 @@ def build_container(
     """
     Build the Docker image with proxy and host networking, then run it interactively.
     """
+    if domains and "imo_grading" in domains:
+        # Separate image namespace prevents reuse of old data-bearing images.
+        image_name = image_name + "-imo-sanitized-v1"
+        if not os.path.exists(os.path.join(repo_path, ".dockerignore")):
+            raise ValueError("Sanitized IMO image requires .dockerignore")
     try:
         # Set up proxy environment
         proxy_env = {

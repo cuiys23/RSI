@@ -9,6 +9,26 @@ from utils.trusted_grading import evaluate
 
 
 class TrustedGradingTests(unittest.TestCase):
+    def test_sandbox_failure_keeps_partial_predictions(self):
+        data = pd.DataFrame({'Grading ID': [str(i) for i in range(100)],
+            'Points': ['6'] * 100, 'Problem': ['p']*100, 'Response': ['a']*100,
+            'Solution': ['s']*100, 'Grading guidelines': ['g']*100})
+        from utils.constants import REPO_NAME
+        container = SimpleNamespace(attrs={'Mounts': [
+            {'Destination': '/' + REPO_NAME, 'Source': 'safe'}], 'Config': {'Image': 'clean'}})
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('utils.trusted_grading.pd.read_csv', return_value=data), \
+                patch('utils.trusted_grading.run_candidate', side_effect=[
+                    (6, None), ('None', 'Sandbox failure: worker stopped')]):
+            with self.assertRaisesRegex(RuntimeError, 'worker stopped'):
+                evaluate(container, directory, 'train', 'screen', 'fixed', 1)
+            folder = Path(directory) / 'pre_eval'
+            status = json.loads((folder / 'stage_status.json').read_text())
+            self.assertEqual(status['completed_samples'], 2)
+            self.assertFalse(status['success'])
+            self.assertTrue((folder / 'predictions.csv').exists())
+            self.assertIn('worker stopped', (folder / 'evaluation.jsonl').read_text())
+
     def test_labels_stay_host_side_and_screening_is_reused(self):
         calls = []
         def candidate(image, source, inputs, *args):

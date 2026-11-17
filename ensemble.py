@@ -4,6 +4,7 @@ import os
 import pandas as pd
 
 from utils.gl_utils import load_archive_data, get_score, get_full_validation_score
+from utils.generation_records import evaluation_directory
 
 
 def ensemble(domain, task, generate_output_dir, split="train"):
@@ -35,8 +36,9 @@ def ensemble(domain, task, generate_output_dir, split="train"):
     if best_genid is None:
         raise ValueError("No eligible agent with evaluation results")
     # Get the prediction from the best agent
-    pred_dirname = f"{domain}_eval" if split == "train" else f"{domain}_eval_{split}"
-    predictions_path = os.path.join(generate_output_dir, f"gen_{best_genid}/{pred_dirname}/predictions.csv")
+    folder = evaluation_directory(os.path.join(generate_output_dir, f"gen_{best_genid}"),
+                                  domain, split, existing=True)
+    predictions_path = folder / "predictions.csv"
     df = pd.read_csv(predictions_path)
     match = df.loc[df["Grading ID" if domain == "imo_grading" else "question_id"].astype(str) == str(question_id), "prediction"]
     if match.empty:

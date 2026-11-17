@@ -56,6 +56,44 @@ python generate_loop.py --domains <domain>
 
 By default, outputs will be saved in `outputs/` directory.
 
+## IMO grading experiment records
+
+Each attempt keeps its existing generation ID (`gen_0`, `gen_1`, ...,
+`gen_30`); round 0 is the initial baseline. New IMO runs write:
+
+```text
+gen_1/
+  metadata.json          # parent, state, models, usage, stage summaries
+  model_patch.diff       # changes relative to parent; empty if no changes
+  meta_agent_chat.md
+  generate.log
+  pre_eval/              # fixed 10 training examples
+  train_eval/            # 100 training examples, reusing screening predictions
+  val_eval/              # 100 validation examples
+```
+
+Each evaluation directory contains `stage_status.json`; attempted stages also
+keep `predictions.csv`, `evaluation.jsonl`, and per-example model traces in
+`agent_evals/`. Successful stages add `report.json`. Predictions are checkpointed after each example;
+failed stages retain partial results. Unreached stages have a status file with
+the reason. Raw container exports and request usage logs are also retained.
+Failed, screening-rejected, and empty-diff attempts remain in the archive.
+
+Regenerate figures from an existing run (no model requests):
+
+```bash
+python -m analysis.visualize_archive --domains imo_grading --path outputs/generate_RUN --svg
+python -m analysis.plot_progress --domains imo_grading --path outputs/generate_RUN --svg
+```
+
+The evolution tree includes isolated nodes, distinguishes failure and screening
+rejection, and exports a JSON file containing node states and parent edges.
+Graphviz is preferred; a deterministic layered layout is used if unavailable.
+Validation plots use only successful complete 100-example results, preserve
+every attempt on the x-axis, and mark missing measurements without assigning
+them zero accuracy. Per-candidate scores and best-so-far scores are exported
+as JSON and CSV. Readers also accept legacy `imo_grading_eval*` directories.
+
 ## File Structure
 - `agent/` code for using foundation models
 - `analysis/` scripts used for plotting and analysis

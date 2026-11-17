@@ -1,4 +1,6 @@
 import argparse
+import csv
+import math
 import os
 from matplotlib import pyplot as plt
 from matplotlib.ticker import MaxNLocator
@@ -10,6 +12,7 @@ from utils.gl_utils import (
     load_archive_data,
     get_patch_files,
 )
+from utils.generation_records import write_json
 from utils.domain_utils import get_domain_splits, can_domain_ensembled
 
 __all__ = ["plot_progress_single", "plot_progress_together"]
@@ -32,6 +35,7 @@ def _plot_progress_core(
     iterations = []
     best_scores = []
     avg_scores = []
+    candidate_scores = []
     it_genid_dict = {}
 
     seen_genids = set()
@@ -53,30 +57,37 @@ def _plot_progress_core(
             it_genid_dict[iteration] = genid
 
             score = scores_by_genid.get(genid, None)
+            if score is not None and not math.isfinite(score):
+                score = None
+            candidate_scores.append(score)
 
             if score is not None:
-                all_scores.append(score)
-                if len(best_scores) == 0 or score > best_scores[-1]:
+                if not all_scores or score > max(all_scores):
                     best_genid = genid
+                all_scores.append(score)
 
-            best_scores.append(max(all_scores) if all_scores else 0.0)
-            avg_scores.append(sum(all_scores) / len(all_scores) if all_scores else 0.0)
+            best_scores.append(max(all_scores) if all_scores else None)
+            avg_scores.append(sum(all_scores) / len(all_scores) if all_scores else None)
 
     log_lines.append(f"Total iterations: {len(iterations)}")
-    log_lines.append(f"Best scores: {[round(xs, 5) for xs in best_scores]}")
+    log_lines.append(f"Best scores: {[round(xs, 5) if xs is not None else None for xs in best_scores]}")
 
     # Best lineage
     lineage_genids = []
     curr = best_genid
     if curr is not None:
-        while not is_starting_node(curr):
+        visited = set()
+        while curr is not None and curr not in visited:
+            visited.add(curr)
             lineage_genids.append(curr)
+            if is_starting_node(curr):
+                break
             curr = get_parent_genid(exp_dir, curr)
-        lineage_genids.append(curr)
         lineage_genids.reverse()
 
-    lineage_iterations = [it for it, gid in it_genid_dict.items() if gid in lineage_genids]
-    lineage_scores = [(scores_by_genid.get(gid) or 0.0) for gid in lineage_genids]
+    lineage_iterations = [it for it, gid in it_genid_dict.items()
+                          if gid in lineage_genids and scores_by_genid.get(gid) is not None]
+    lineage_scores = [scores_by_genid[it_genid_dict[it]] for it in lineage_iterations]
 
     log_lines.append(f"Best lineage genids: {lineage_genids}")
     log_lines.append(f"Best lineage scores: {[round(score, 5) for score in lineage_scores]}")
@@ -90,31 +101,48 @@ def _plot_progress_core(
     }
     color_scheme = color_schemes.get(color, color_schemes["orange"])
 
-    plt.plot(iterations, avg_scores, marker='.', color=color_scheme[1], label='Average of Archive')
-    plt.plot(iterations, best_scores, marker='.', color=color_scheme[0], label='Best Agent')
+    fig, ax = plt.subplots(figsize=(12, 6))
+    measured = [it for it, score in zip(iterations, candidate_scores) if score is not None]
+    ax.scatter(measured, [candidate_scores[it] for it in measured], s=35,
+               color="#555555", label="Candidate (complete evaluation)", zorder=4)
+    ax.plot(iterations, avg_scores, marker='.', color=color_scheme[1], label='Average of Measured Archive')
+    ax.step(iterations, best_scores, where='post', color=color_scheme[0], label='Best Agent So Far')
     if lineage_iterations:
-        plt.plot(lineage_iterations, lineage_scores, marker='o', color=color_scheme[2], label='Lineage to Final Best Agent')
-    plt.xlabel("Iterations", fontsize=18)
-    plt.ylabel("Score", fontsize=18)
-    plt.grid()
-    plt.legend(fontsize=14)
-    plt.tight_layout()
-    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
-    plt.xticks(fontsize=14)
-    plt.yticks(fontsize=14)
+        ax.plot(lineage_iterations, lineage_scores, marker='o', color=color_scheme[2], label='Lineage to Final Best Agent')
+    missing = [it for it, score in zip(iterations, candidate_scores) if score is None]
+    if missing:
+        ax.scatter(missing, [-0.08] * len(missing), marker='x', color="#c62828",
+                   transform=ax.get_xaxis_transform(), clip_on=False,
+                   label='No complete evaluation', zorder=5)
+    ax.set_xlabel("Modification attempts (baseline = 0)", fontsize=12, labelpad=30 if missing else 5)
+    ax.set_ylabel("Full validation accuracy" if split == "val" else "Score", fontsize=12)
+    if split == "val":
+        ax.set_ylim(-0.03, 1.03)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
     plot_png = os.path.join(exp_dir, f"progress_plot_{label_suffix}_{split}_{type}.png")
-    plt.savefig(plot_png)
+    fig.savefig(plot_png)
+    records = [dict(iteration=it, genid=it_genid_dict[it], score=candidate_scores[it],
+                    best_score=best_scores[it], archive_mean=avg_scores[it]) for it in iterations]
+    data_base = os.path.join(exp_dir, f"progress_data_{label_suffix}_{split}_{type}")
+    write_json(data_base + ".json", records)
+    with open(data_base + ".csv", "w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["iteration", "genid", "score", "best_score", "archive_mean"])
+        writer.writeheader()
+        writer.writerows(records)
 
     log_lines.append("Progress plot saved at:")
     log_lines.append(f"- {plot_png}")
 
     if svg:
         plot_svg = os.path.join(exp_dir, f"progress_plot_{label_suffix}_{split}_{type}.svg")
-        plt.savefig(plot_svg)
+        fig.savefig(plot_svg)
         log_lines.append(f"- {plot_svg}")
 
-    plt.close()
+    plt.close(fig)
 
     print("\n".join(log_lines), '\n')
     log_path = os.path.join(exp_dir, f"progress_info_{label_suffix}_{split}_{type}.txt")

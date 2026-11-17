@@ -3,6 +3,12 @@
 import argparse
 import json
 import os
+import random
+
+from utils.experiment import META_MODEL, TASK_MODEL, MAX_GENERATION, RANDOM_SEED, summarize_usage
+from utils.generation_records import (
+    collect_agent_artifacts, finalize_record, initialize_record, write_json,
+)
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -303,9 +309,12 @@ def get_ensemble_scores_container(
 def eval_produced_agent(
     container, container_output_folder, gen_output_dir, domain,
     eval_samples=-1, eval_workers=10, eval_subset="_filtered_100_train",
-    split="train", stage="full",
+    split="train", stage="full", task_model=TASK_MODEL, generation=0,
 ):
     """Evaluate exactly one split; keep screening artifacts separate."""
+    if domain == "imo_grading":
+        from utils.trusted_grading import evaluate
+        return evaluate(container, gen_output_dir, split, stage, task_model, generation)
     if stage not in {"screen", "full"} or split not in {"train", "val", "test"}:
         raise ValueError(f"Invalid evaluation stage/split: {stage}/{split}")
     if stage == "screen" and split != "train":
@@ -321,7 +330,10 @@ def eval_produced_agent(
     os.makedirs(local_output, exist_ok=True)
 
     def checked(command):
-        result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
+        result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}", environment={
+            "RSI_FIXED_MODEL": task_model, "RSI_GENERATION": str(generation),
+            "RSI_CATEGORY": "task_evaluation", "RSI_USAGE_PATH": "/tmp/task_usage.jsonl",
+        })
         log_container_output(result)
         if result.exit_code != 0:
             raise RuntimeError(f"{domain}/{split}/{stage}: exit {result.exit_code}: {result.output!r}")
@@ -399,9 +411,19 @@ def copy_prev_eval_to_container(
     container.exec_run(["mkdir", "-p", container_output_folder], workdir="/")
 
     # Copy the whole tree into the container in one go
-    copy_to_container(
-        container, source_path=prev_eval_path, dest_path=container_prev_eval_path
-    )
+    import tempfile
+    import shutil
+    def feedback_ignore(folder, names):
+        return [name for name in names if (
+            "_test" in name or "_val" in name or name == ".git"
+            or name in {"val_eval", "test_eval", "final_test"}
+            or name == "grading_split_ids.json" or REPO_NAME == name
+            or name.startswith("gradingbench")
+        )]
+    with tempfile.TemporaryDirectory() as temporary:
+        sanitized = os.path.join(temporary, "feedback")
+        shutil.copytree(prev_eval_path, sanitized, ignore=feedback_ignore)
+        copy_to_container(container, source_path=sanitized, dest_path=container_prev_eval_path)
 
     # Now prune inside the container
     prune_cmds = [
@@ -464,6 +486,8 @@ def generate(
     skip_staged_eval=False,
     edit_select_parent=False,
     max_generation=None,
+    meta_model=META_MODEL,
+    task_model=TASK_MODEL,
 ):
     # Setup local output folder
     prev_gen_dir = os.path.join(output_dir, f"gen_{parent_genid}")
@@ -475,7 +499,7 @@ def generate(
         "current_genid": current_genid,
         "parent_genid": parent_genid,
         "run_baseline": run_baseline,
-        "prev_patch_files": [],
+        "prev_patch_files": get_patch_files(output_dir, parent_genid),
         "curr_patch_files": [],
         "parent_agent_success": not run_meta_agent,  # meta agent success if not run
         "optimize_option": optimize_option,
@@ -484,22 +508,24 @@ def generate(
     }
     run_eval = not run_meta_agent  # always run eval if not running meta agent
     metadata["run_eval"] = run_eval
+    initialize_record(metadata, domains, meta_model, task_model)
     print(metadata)
 
     # Create and start the Docker container
     image_name = f"{REPO_NAME}"
     container_name = f"{REPO_NAME}-gl-container-{run_id}"
-    container = build_container(
-        docker_client,
-        root_dir,
-        image_name,
-        container_name,
-        domains=domains,
-    )
-    container.start()
+    container = None
+    commit_hash = None
+    container_agentoutput_folder = "/tmp/agent_output"
     container_output_folder = "/tmp/"
 
     try:
+        container = build_container(docker_client, root_dir, image_name,
+                                    container_name, domains=domains)
+        if container is None:
+            raise RuntimeError("Container creation failed")
+        container.start()
+        container.exec_run(["touch", "/tmp/meta_usage.jsonl", "/tmp/task_usage.jsonl"])
         # Make a copy of the repo
         if run_baseline and "no_selfimprove" in run_baseline:
             donottouch_reponame = f"/DONOTTOUCH_{REPO_NAME}"
@@ -519,7 +545,6 @@ def generate(
 
         # Apply all lineage diffs
         patch_files = get_patch_files(output_dir, parent_genid)
-        metadata["prev_patch_files"] += patch_files
         commit_hash = apply_diffs_container(container, patch_files)
 
         if run_meta_agent:
@@ -602,10 +627,7 @@ def generate(
                     container_agentoutput_folder,
                     "--iterations_left",
                     str(max_generation - current_genid),
-                    *(
-                        # If domain is polyglot, for a fair comparison with DGM
-                        ["--model", "claude-3-5-sonnet-20241022"] if domains == ["polyglot"] else []
-                    ),
+                    "--model", meta_model,
                 ]
 
             run_workdir = (
@@ -613,10 +635,23 @@ def generate(
                 if run_baseline and "no_selfimprove" in run_baseline
                 else f"/{REPO_NAME}"
             )
-            exec_result = container.exec_run(cmd=command, workdir=run_workdir)
-            log_container_output(exec_result)
+            exec_result = container.exec_run(cmd=command, workdir=run_workdir, environment={
+                "RSI_FIXED_MODEL": meta_model, "RSI_GENERATION": str(current_genid),
+                "RSI_CATEGORY": "self_modification", "RSI_USAGE_PATH": "/tmp/meta_usage.jsonl",
+            })
             metadata["parent_agent_success"] = exec_result.exit_code == 0
+            log_container_output(exec_result)
 
+            # Restore framework files even when the meta process failed before
+            # its own patch-export cleanup. Agent source files remain editable.
+            framework_paths = ["agent/llm.py", "utils/experiment.py", "domains/",
+                               "run_meta_agent.py", "generate_loop.py", "utils/gl_utils.py",
+                               "utils/docker_utils.py", "utils/generation_records.py"]
+            result = container.exec_run(
+                ["git", "checkout", commit_hash, "--", *framework_paths],
+                workdir=f"/{REPO_NAME}",
+            )
+            log_container_output(result)
             # Copy container outputs to local
             local_agentoutput_folder = os.path.join(gen_output_dir, "agent_output/")
             copy_from_container(
@@ -629,24 +664,32 @@ def generate(
             local_patch_file = os.path.join(
                 local_agentoutput_folder, "model_patch.diff"
             )
-            metadata["curr_patch_files"].append(local_patch_file)
+            collect_agent_artifacts(metadata)
             run_eval = file_exist_and_not_empty(local_patch_file)
             metadata["run_eval"] = run_eval
+            metadata["no_changes"] = not run_eval
 
             # Run commands to check if the agents are compilable
-            run_commands_to_check_compilation(container, run_baseline=run_baseline, edit_select_parent=edit_select_parent)
+            if run_eval:
+                run_commands_to_check_compilation(container, run_baseline=run_baseline, edit_select_parent=edit_select_parent)
 
         # Evaluate the produced agent
         if run_eval and "agent" in optimize_option:
             log_path = os.path.join(gen_output_dir, "generate.log")
 
             def eval_agent_worker(domain, subset, count, split, stage):
-                setup_logger(log_path)
-                return eval_produced_agent(
-                    container, container_output_folder, gen_output_dir,
-                    domain=domain, eval_samples=count, eval_workers=eval_workers,
-                    eval_subset=subset, split=split, stage=stage,
-                )
+                worker_logger = setup_logger(log_path)
+                try:
+                    return eval_produced_agent(
+                        container, container_output_folder, gen_output_dir,
+                        domain=domain, eval_samples=count, eval_workers=eval_workers,
+                        eval_subset=subset, split=split, stage=stage,
+                        task_model=task_model, generation=current_genid,
+                    )
+                finally:
+                    for handler in list(worker_logger.handlers):
+                        worker_logger.removeHandler(handler)
+                        handler.close()
 
             metadata["run_full_eval"] = False
             metadata["screening"] = {}
@@ -697,21 +740,56 @@ def generate(
         safe_log(f"Error in generate: {e}")
         metadata["run_eval"] = False
         metadata["evaluation_error"] = str(e)
+        import traceback
+        with open(os.path.join(gen_output_dir, "failure.log"), "a", encoding="utf-8") as stream:
+            stream.write(traceback.format_exc())
+
+    except KeyboardInterrupt:
+        metadata["run_eval"] = False
+        metadata["evaluation_error"] = "Interrupted by user"
+        raise
 
     # Even on errors or KeyboardInterrupt
     finally:
-        # Reset to the root commit
-        exec_result = container.exec_run(
-            cmd=["git", "reset", "--hard", root_commit], workdir=f"/{REPO_NAME}"
-        )
-        log_container_output(exec_result)
-        exec_result = container.exec_run(
-            cmd=["git", "clean", "-fd"], workdir=f"/{REPO_NAME}"
-        )
-        log_container_output(exec_result)
-
-        # Cleanup container
-        cleanup_container(container)
+        # Export partial outputs before any reset, including failed meta runs.
+        if container is not None and run_meta_agent:
+            try:
+                copy_from_container(container, source_path=container_agentoutput_folder,
+                                    dest_path=os.path.join(gen_output_dir, "agent_output"))
+                collect_agent_artifacts(metadata)
+            except Exception as error:
+                metadata.setdefault("artifact_errors", []).append(str(error))
+            if commit_hash and not os.path.exists(os.path.join(gen_output_dir, "agent_output", "model_patch.diff")):
+                try:
+                    from utils.git_utils import diff_versus_commit
+                    patch = diff_versus_commit(root_dir, commit_hash)
+                    with open(os.path.join(gen_output_dir, "model_patch.diff"), "w", encoding="utf-8") as stream:
+                        stream.write(patch)
+                    metadata["curr_patch_files"] = [os.path.join(gen_output_dir, "model_patch.diff")]
+                except Exception as error:
+                    metadata.setdefault("artifact_errors", []).append(str(error))
+        metadata["models"] = {"meta_model": meta_model, "task_model": task_model}
+        metadata["token_usage"] = {}
+        for category, filename in (("self_modification", "meta_usage.jsonl"),
+                                   ("task_evaluation", "task_usage.jsonl")):
+            local_usage = os.path.join(gen_output_dir, filename)
+            try:
+                if container is not None and not (category == "task_evaluation" and "imo_grading" in domains):
+                    copy_from_container(container, source_path="/tmp/" + filename, dest_path=local_usage)
+                metadata["token_usage"].update(summarize_usage(local_usage))
+            except Exception as error:
+                metadata.setdefault("accounting_errors", []).append(str(error))
+        # Cleanup errors must not erase the record of an attempted generation.
+        if container is not None:
+            try:
+                for command in (["git", "reset", "--hard", root_commit], ["git", "clean", "-fd"]):
+                    log_container_output(container.exec_run(cmd=command, workdir=f"/{REPO_NAME}"))
+            except Exception as error:
+                metadata.setdefault("cleanup_errors", []).append(str(error))
+            try:
+                cleanup_container(container)
+            except Exception as error:
+                metadata.setdefault("cleanup_errors", []).append(str(error))
 
         # Save metadata
         eval_successful = all(
@@ -720,6 +798,9 @@ def generate(
                 for domain in domains
             ]
         )
+        # Validation readers inspect metadata too; replace the initial running
+        # snapshot before deciding whether this completed candidate is eligible.
+        write_json(os.path.join(gen_output_dir, "metadata.json"), metadata)
         if "imo_grading" in domains:
             metadata["valid_parent"] = bool(
                 metadata["parent_agent_success"] and metadata["run_eval"]
@@ -728,8 +809,12 @@ def generate(
             )
         else:
             metadata["valid_parent"] = metadata["run_eval"] and (eval_successful or meta_patch_files is not None)
-        with open(os.path.join(gen_output_dir, "metadata.json"), "w") as f:
-            json.dump(metadata, f, indent=4)
+        try:
+            finalize_record(metadata, domains)
+        finally:
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                handler.close()
 
     return metadata
 
@@ -737,7 +822,7 @@ def generate(
 def generate_loop(
     domains,
     run_id=None,
-    max_generation=3,
+    max_generation=MAX_GENERATION,
     eval_samples=-1,
     eval_workers=5,
     eval_subsets=[],
@@ -754,12 +839,29 @@ def generate_loop(
     eval_test=False,
     skip_staged_eval=False,
     edit_select_parent=False,
+    meta_model=META_MODEL,
+    task_model=TASK_MODEL,
+    random_seed=RANDOM_SEED,
 ):
     # Initialization
+    if "imo_grading" in domains and eval_test:
+        raise ValueError("eval_test is forbidden during evolution; use frozen final testing")
+    if max_generation != MAX_GENERATION:
+        raise ValueError("This experiment requires exactly 30 modification rounds")
+    random.seed(random_seed)
+    import numpy as np
+    np.random.seed(random_seed)
     docker_client = docker.DockerClient()
     parent_selection = "latest" if run_baseline == "no_archive" else parent_selection
     if resume_from:
         output_dir = os.path.normpath(os.path.abspath(resume_from))
+        if os.path.exists(os.path.join(output_dir, "final_test", "selection.json")):
+            raise ValueError("Search is frozen after final test selection")
+        with open(os.path.join(output_dir, "experiment_config.json")) as stream:
+            saved_config = json.load(stream)
+        if saved_config != dict(meta_model=meta_model, task_model=task_model,
+                                max_generation=max_generation, random_seed=random_seed):
+            raise ValueError("Resume configuration differs from the saved experiment")
         run_id = os.path.basename(output_dir).split("generate_")[-1]
         root_dir, root_commit = setup_initial_gen(
             output_dir,
@@ -804,7 +906,7 @@ def generate_loop(
 
         # Create initial node
         if meta_patch_files is None or len(meta_patch_files) <= 0:
-            archive = update_and_save_archive(output_dir, [], new_node="initial")
+            archive = [] if "imo_grading" in domains else update_and_save_archive(output_dir, [], new_node="initial")
             metadata = {
                 "gen_output_dir": os.path.join(output_dir, f"gen_initial"),
                 "prev_patch_files": [],
@@ -814,7 +916,7 @@ def generate_loop(
         elif reset_task_agent:
             # Task agent is the same as initial agent
             meta_patch_files = process_meta_patch_files(meta_patch_files, output_dir, reset_task_agent=reset_task_agent, reset_meta_agent=reset_meta_agent)
-            archive = update_and_save_archive(output_dir, [], new_node="initial")
+            archive = [] if "imo_grading" in domains else update_and_save_archive(output_dir, [], new_node="initial")
             gen_output_dir = os.path.join(output_dir, f"gen_initial")
             metadata = {
                 "gen_output_dir": gen_output_dir,
@@ -858,11 +960,26 @@ def generate_loop(
                 skip_staged_eval=skip_staged_eval,
                 edit_select_parent=edit_select_parent,
                 max_generation=max_generation,
+                meta_model=meta_model, task_model=task_model,
             )
             print(f"generate_loop: generation 0 completed, parent None")
             # Evaluate the agent on polyglot if needed
             if "polyglot" in domains:
                 run_harness_polyglot(root_dir, output_dir, 0, skip_staged_eval=skip_staged_eval, num_samples=eval_samples[domains.index("polyglot")])
+
+        # Re-evaluate the initial grading agent as round 0 with the same fixed
+        # model and accounting as descendants; imported old scores are not used.
+        if "imo_grading" in domains and (not meta_patch_files or reset_task_agent):
+            metadata = generate(
+                docker_client, ["imo_grading"], output_dir, run_id,
+                current_genid=0, parent_genid=None, root_dir=root_dir,
+                root_commit=root_commit, eval_samples=[100], eval_workers=eval_workers,
+                eval_subsets=["_filtered_100_train"], run_meta_agent=False,
+                meta_patch_files=meta_patch_files, skip_staged_eval=True,
+                max_generation=max_generation, meta_model=meta_model, task_model=task_model,
+            )
+            # Round 0 is the baseline, not a modification attempt.
+            archive = update_and_save_archive(output_dir, [], new_node=0)
 
         # Evaluate the entire archive as an ensemble
         eval_ensemble = (
@@ -897,6 +1014,17 @@ def generate_loop(
                     ],
                 )
 
+    config = dict(meta_model=meta_model, task_model=task_model,
+                  max_generation=max_generation, random_seed=random_seed)
+    config_path = os.path.join(output_dir, "experiment_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as stream:
+            if json.load(stream) != config:
+                raise ValueError("Resume configuration differs from the saved experiment")
+    else:
+        with open(config_path, "w") as stream:
+            json.dump(config, stream, indent=2)
+
     # Save args
     with open(os.path.join(output_dir, "generate_loop.log"), "a") as f:
         args_dict = locals()
@@ -904,7 +1032,8 @@ def generate_loop(
         f.write(f"Args: {args_str}\n")
 
     # Run generations
-    start_genid = len(archive)
+    start_genid = max([n for n in archive if isinstance(n, int)] + [0]) + 1
+    random.seed(random_seed + start_genid)
     if not edit_select_parent or run_baseline == "no_archive":
         parent_genid = select_parent(archive, output_dir, domains, method=parent_selection)
     else:
@@ -916,28 +1045,49 @@ def generate_loop(
             root_dir, root_commit,
         )
     for current_genid in range(start_genid, max_generation + 1):
-        metadata = generate(
-            docker_client,
-            [d for d in domains if d != "polyglot"],
-            output_dir,
-            run_id,
-            current_genid,
-            parent_genid=parent_genid,
-            root_dir=root_dir,
-            root_commit=root_commit,
-            eval_samples=eval_samples,
-            eval_workers=eval_workers,
-            eval_subsets=eval_subsets,
-            meta_patch_files=meta_patch_files,
-            run_meta_agent=True,
-            run_baseline=run_baseline,
-            optimize_option=optimize_option,
-            agent_archive_path=agent_archive_path,
-            eval_test=eval_test,
-            skip_staged_eval=skip_staged_eval,
-            edit_select_parent=edit_select_parent,
-            max_generation=max_generation,
-        )
+        try:
+            metadata = generate(
+                docker_client,
+                [d for d in domains if d != "polyglot"],
+                output_dir,
+                run_id,
+                current_genid,
+                parent_genid=parent_genid,
+                root_dir=root_dir,
+                root_commit=root_commit,
+                eval_samples=eval_samples,
+                eval_workers=eval_workers,
+                eval_subsets=eval_subsets,
+                meta_patch_files=meta_patch_files,
+                run_meta_agent=True,
+                run_baseline=run_baseline,
+                optimize_option=optimize_option,
+                agent_archive_path=agent_archive_path,
+                eval_test=eval_test,
+                skip_staged_eval=skip_staged_eval,
+                edit_select_parent=edit_select_parent,
+                max_generation=max_generation,
+                meta_model=meta_model, task_model=task_model,
+            )
+
+        except Exception as error:
+            # Infrastructure/cleanup failures still consume an attempted round.
+            folder = os.path.join(output_dir, f"gen_{current_genid}")
+            os.makedirs(folder, exist_ok=True)
+            saved = os.path.join(folder, "metadata.json")
+            metadata = load_json_file(saved) if os.path.exists(saved) else {}
+            metadata.update(current_genid=current_genid, parent_genid=parent_genid,
+                            gen_output_dir=folder, parent_agent_success=False,
+                            run_eval=False, valid_parent=False, evaluation_error=str(error))
+            metadata.setdefault("prev_patch_files", get_patch_files(output_dir, parent_genid))
+            metadata.setdefault("curr_patch_files", [])
+            initialize_record(metadata, domains, meta_model, task_model)
+            finalize_record(metadata, domains)
+
+        except KeyboardInterrupt:
+            # generate() finalized this interrupted attempt before propagating.
+            update_and_save_archive(output_dir, archive, new_node=current_genid)
+            raise
 
         # NOTE: need to update and save archive before running ensembling eval
         archive = update_and_save_archive(output_dir, archive, new_node=current_genid)
@@ -1021,7 +1171,8 @@ def generate_loop(
                         domains, output_dir, split=split, type=stype
                     )
 
-        # Select next parent
+        # Select next parent; deterministic across stop/resume boundaries.
+        random.seed(random_seed + current_genid + 1)
         parent_genid = None
         if not edit_select_parent or run_baseline == "no_archive":
             parent_genid = select_parent(archive, output_dir, domains, method=parent_selection)
@@ -1077,8 +1228,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_generation",
         type=int,
-        default=10,
-        help="Maximum number of evolution generations",
+        default=MAX_GENERATION,
+        help="Total modification attempts (fixed at 30)",
     )
     parser.add_argument(
         "--eval_samples",
@@ -1179,6 +1330,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to allow the agent to edit the selection mechanism",
     )
+    parser.add_argument("--meta_model", default=META_MODEL)
+    parser.add_argument("--task_model", default=TASK_MODEL)
+    parser.add_argument("--random_seed", type=int, default=RANDOM_SEED)
     args = parser.parse_args()
 
     # Post-parse validation
@@ -1196,6 +1350,7 @@ if __name__ == "__main__":
     eval_subsets = [get_domain_eval_subset(d) for d in args.domains]
     output_dir = generate_loop(
         domains=args.domains,
+        meta_model=args.meta_model, task_model=args.task_model, random_seed=args.random_seed,
         run_id=args.run_id,
         max_generation=args.max_generation,
         eval_samples=eval_samples,

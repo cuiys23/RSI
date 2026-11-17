@@ -1,7 +1,7 @@
 import argparse
 import os
 
-from agent.llm import CLAUDE_MODEL
+from utils.experiment import META_MODEL
 from meta_agent import MetaAgent
 from utils.git_utils import diff_versus_commit, reset_paths_to_commit
 
@@ -12,7 +12,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=CLAUDE_MODEL,
+        default=META_MODEL,
         help="Model to use for the agent",
     )
     parser.add_argument(
@@ -60,7 +60,9 @@ def main():
 
     # Reset unwanted diffs
     reset_paths_to_commit(
-        git_dname=args.git_dir, commit=args.base_commit, paths=["domains/"]
+        git_dname=args.git_dir, commit=args.base_commit, paths=["domains/", "agent/llm.py", "utils/experiment.py", "generate_loop.py",
+               "run_meta_agent.py", "utils/gl_utils.py", "utils/docker_utils.py",
+               "utils/generation_records.py"]
     )
 
     # Save git diff
